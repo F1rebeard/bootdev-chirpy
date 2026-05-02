@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bootdev-chirpy/internal/auth"
 	"bootdev-chirpy/internal/database"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -29,6 +33,19 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+}
+
+type Chirp struct {
+	Body   string    `json:"body"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type ChirpResponse struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -63,17 +80,38 @@ func (cfg *apiConfig) metricHitsReset(w http.ResponseWriter, req *http.Request) 
 }
 
 func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
-	type email struct {
-		Email string `json:"email"`
+	type request struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	decoder := json.NewDecoder(r.Body)
-	newEmail := email{}
-	err := decoder.Decode(&newEmail)
+	newRequest := request{}
+	err := decoder.Decode(&newRequest)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
-	newUser, err := cfg.db.CreateUser(r.Context(), newEmail.Email)
+	_, err = cfg.usersExists(r.Context(), newRequest.Email)
+	if err == nil {
+		respondWithError(w, http.StatusConflict, "Email already registered")
+		return
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		respondWithError(w, http.StatusInternalServerError, "Could not create user")
+		return
+	}
+	hashedPassword, err := auth.HashPassword(newRequest.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not create user")
+		return
+	}
+	newUser, err := cfg.db.CreateUser(
+		r.Context(),
+		database.CreateUserParams{
+			Email:          newRequest.Email,
+			HashedPassword: hashedPassword,
+		},
+	)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not create user")
 		return
@@ -85,6 +123,126 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 		Email:     newUser.Email,
 	}
 	respondWithJSON(w, http.StatusCreated, newUserResp)
+}
+
+func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
+	type loginRequest struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	newRequest := loginRequest{}
+	err := decoder.Decode(&newRequest)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+	existingUser, err := cfg.usersExists(r.Context(), newRequest.Email)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "User not found")
+		return
+	}
+	validatePassword, err := auth.CheckPasswordHash(newRequest.Password, existingUser.HashedPassword)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid password")
+		return
+	}
+	if !validatePassword {
+		respondWithError(w, http.StatusUnauthorized, "Invalid password")
+		return
+	}
+	userResp := User{
+		ID:        existingUser.ID,
+		CreatedAt: existingUser.CreatedAt,
+		UpdatedAt: existingUser.UpdatedAt,
+		Email:     existingUser.Email,
+	}
+	respondWithJSON(w, http.StatusOK, userResp)
+}
+
+func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request) {
+	decoder := json.NewDecoder(r.Body)
+	var newChirp Chirp
+	err := decoder.Decode(&newChirp)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+	formatBody, err := validateChirpHandler(newChirp.Body)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	newChirp.Body = formatBody
+	createChirp := database.CreateChirpParams{UserID: newChirp.UserID, Body: newChirp.Body}
+	createdChirp, err := cfg.db.CreateChirp(r.Context(), createChirp)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not create chirp")
+		return
+	}
+	responseChirp := ChirpResponse{
+		ID:        createdChirp.ID,
+		CreatedAt: createdChirp.CreatedAt,
+		UpdatedAt: createdChirp.UpdatedAt,
+		Body:      createdChirp.Body,
+		UserID:    createdChirp.UserID,
+	}
+	respondWithJSON(w, http.StatusCreated, responseChirp)
+}
+
+func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	allChirps, err := cfg.db.GetChirps(r.Context())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not get chirps")
+		return
+	}
+
+	respChirps := make([]ChirpResponse, 0, len(allChirps))
+	for _, chirp := range allChirps {
+		respChirp := ChirpResponse{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID,
+		}
+		respChirps = append(respChirps, respChirp)
+	}
+	respondWithJSON(w, http.StatusOK, respChirps)
+}
+
+func (cfg *apiConfig) getChirpHandler(w http.ResponseWriter, r *http.Request) {
+	chirpID := r.PathValue("chirpID")
+	chirpUUID, err := uuid.Parse(chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request  for chirp")
+		return
+	}
+	chirp, err := cfg.db.GetChirp(r.Context(), chirpUUID)
+	if errors.Is(err, sql.ErrNoRows) {
+		respondWithError(w, http.StatusNotFound, "Chirp not found")
+		return
+	}
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not get chirp")
+		return
+	}
+	responseChirp := ChirpResponse{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	}
+	respondWithJSON(w, http.StatusOK, responseChirp)
+}
+
+func (cfg *apiConfig) usersExists(ctx context.Context, email string) (database.User, error) {
+	registeredUser, err := cfg.db.GetUserByEmail(ctx, email)
+	if err != nil {
+		return database.User{}, err
+	}
+	return registeredUser, nil
 }
 
 func main() {
@@ -106,16 +264,32 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("GET /app", cfg.middlewareMetricsInc(appHandler))
 	mux.Handle("GET /app/assets/", cfg.middlewareMetricsInc(assetsHandler))
+
+	mux.HandleFunc("GET /api/chirps", cfg.getChirpsHandler)
+	mux.HandleFunc("POST /api/chirps", cfg.createChirpHandler)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirpHandler)
 	mux.HandleFunc("GET /api/healthz", readinessHandler)
+	mux.HandleFunc("POST /api/login", cfg.loginHandler)
+	mux.HandleFunc("POST /api/users", cfg.createUserHandler)
+
 	mux.HandleFunc("GET /admin/metrics", cfg.metricHits)
 	mux.HandleFunc("POST /admin/reset", cfg.metricHitsReset)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirpHandler)
-	mux.HandleFunc("POST /api/users", cfg.createUserHandler)
 
 	httpServer := &http.Server{}
 	httpServer.Handler = mux
 	httpServer.Addr = ":8080"
-	if err := httpServer.ListenAndServe(); err != nil {
+
+	signalChan := make(chan os.Signal, 1)
+	errChan := make(chan error)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	fmt.Printf("Starting server at %s\n", httpServer.Addr)
+	go func() {
+		errChan <- httpServer.ListenAndServe()
+	}()
+	select {
+	case <-signalChan:
+		fmt.Println("Server is shutting down...")
+	case err := <-errChan:
 		log.Fatal(err)
 	}
 }
@@ -151,32 +325,17 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(jsonResponse)
 }
 
-func validateChirpHandler(w http.ResponseWriter, r *http.Request) {
-	type chirp struct {
-		Body string `json:"body"`
-	}
-	type validResponse struct {
-		CleanedBody string `json:"cleaned_body"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	incomingChirp := chirp{}
-	err := decoder.Decode(&incomingChirp)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Something went wrong")
-		return
-	}
-	if utf8.RuneCountInString(incomingChirp.Body) > 140 {
+func validateChirpHandler(body string) (string, error) {
+	if utf8.RuneCountInString(body) > 140 {
 		log.Printf(
-			"Incoming reques chirp is too long: %d symbols",
-			utf8.RuneCountInString(incomingChirp.Body),
+			"Incoming chirp is too long: %d symbols",
+			utf8.RuneCountInString(body),
 		)
-		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
-		return
+		return "", errors.New("chirp is too long")
 	}
-	cleanedString := cleanChirp(incomingChirp.Body)
-	log.Printf("Cleaned chirp for response: %s", cleanedString)
-	respondWithJSON(w, http.StatusOK, validResponse{CleanedBody: cleanedString})
-
+	cleanBody := cleanChirp(body)
+	log.Printf("Cleaned chirp for response: %s", cleanBody)
+	return cleanBody, nil
 }
 
 func cleanChirp(body string) string {
