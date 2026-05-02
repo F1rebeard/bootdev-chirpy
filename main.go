@@ -26,6 +26,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	jwtSecret      string
 }
 
 type User struct {
@@ -33,11 +34,11 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token     string    `json:"token"`
 }
 
 type Chirp struct {
-	Body   string    `json:"body"`
-	UserID uuid.UUID `json:"user_id"`
+	Body string `json:"body"`
 }
 
 type ChirpResponse struct {
@@ -127,8 +128,9 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 
 func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 	type loginRequest struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email        string `json:"email"`
+		Password     string `json:"password"`
+		ExpiresInSec int    `json:"expires_in_sec"`
 	}
 	decoder := json.NewDecoder(r.Body)
 	newRequest := loginRequest{}
@@ -151,19 +153,39 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "Invalid password")
 		return
 	}
+	expires := newRequest.ExpiresInSec
+	if expires <= 0 || expires > 3600 {
+		expires = 3600 // default: 1 hour
+	}
+	token, err := auth.MakeJWT(existingUser.ID, cfg.jwtSecret, time.Duration(expires)*time.Second)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not create token")
+		return
+	}
 	userResp := User{
 		ID:        existingUser.ID,
 		CreatedAt: existingUser.CreatedAt,
 		UpdatedAt: existingUser.UpdatedAt,
 		Email:     existingUser.Email,
+		Token:     token,
 	}
 	respondWithJSON(w, http.StatusOK, userResp)
 }
 
 func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token")
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token")
+		return
+	}
 	decoder := json.NewDecoder(r.Body)
 	var newChirp Chirp
-	err := decoder.Decode(&newChirp)
+	err = decoder.Decode(&newChirp)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
@@ -174,7 +196,7 @@ func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	newChirp.Body = formatBody
-	createChirp := database.CreateChirpParams{UserID: newChirp.UserID, Body: newChirp.Body}
+	createChirp := database.CreateChirpParams{UserID: userID, Body: newChirp.Body}
 	createdChirp, err := cfg.db.CreateChirp(r.Context(), createChirp)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not create chirp")
@@ -249,13 +271,15 @@ func main() {
 
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	jwtSecret := os.Getenv("JWT_SECRET")
 	databaseQueries, err := connectionDatabase(dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	cfg := &apiConfig{
-		db:       databaseQueries,
-		platform: platform,
+		db:        databaseQueries,
+		platform:  platform,
+		jwtSecret: jwtSecret,
 	}
 
 	appHandler := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
