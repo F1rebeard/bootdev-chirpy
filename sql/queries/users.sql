@@ -10,3 +10,14 @@ TRUNCATE users CASCADE;
 SELECT id, created_at, updated_at, email, hashed_password
 FROM users
 WHERE email = $1;
+
+-- name: UpdateEmailAndPassword :one
+UPDATE users
+SET email = $1, hashed_password = $2, updated_at = now()
+WHERE id = $3
+RETURNING *;
+
+-- name: UpgradeUserChirpyRed :exec
+UPDATE users
+SET is_chirpy_red = TRUE
+WHERE id = $1;
